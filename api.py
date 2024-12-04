@@ -103,7 +103,7 @@ class ParamsApi:
 
     def dict_to_excel(self, doc, path):
         name_labs, total_candidats = zip(*doc.items())
-        print(total_candidats)
+        
         # Подготовка списка кандидатов с объединением строк по каждому элементу
         list_of_total_candidats = ['\n'.join(candidat.replace('\n"','').replace('"','').split(',')) for candidat in total_candidats]
         
