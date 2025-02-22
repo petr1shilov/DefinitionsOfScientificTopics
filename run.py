@@ -4,21 +4,24 @@ import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import  CommandStart, StateFilter
-from aiogram.fsm.state import default_state
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
+    CallbackQuery,
     FSInputFile
 )
-from aiogram.utils.deep_linking import create_start_link
 import time
 
 import config
 
 from bot.states import UserStates
+from bot.keyboards import get_keyboard
 from bot.texts import *
-from api import ParamsApi
+from gpt_answer_api import GPTGenApi
+from oeсd_api import OEСDApi
 
 TOKEN = config.bot_token
 
@@ -26,9 +29,10 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 bot = Bot(TOKEN)
 
-api = ParamsApi()
-
 bot_logger = logging.getLogger('bot_logger')
+
+if bot_logger.hasHandlers():
+    bot_logger.handlers.clear()
 
 # Настраиваем формат и уровень логирования только для нашего логгера
 handler = logging.StreamHandler()
@@ -37,6 +41,22 @@ handler.setFormatter(formatter)
 bot_logger.addHandler(handler)
 bot_logger.setLevel(logging.INFO)
 
+async def safe_delete_messages(chat_id: int, message_ids: list):
+    """Функция безопасного удаления сообщений с обработкой ошибок."""
+    if not message_ids:
+        return
+
+    try:
+        await bot.delete_messages(chat_id=chat_id, message_ids=message_ids)
+    except TelegramBadRequest:
+        bot_logger.warning(f"Сообщения {message_ids} уже удалены или не существуют.")
+    except TelegramForbiddenError:
+        bot_logger.warning(f"Нет прав на удаление сообщений в чате {chat_id}.")
+    except TelegramRetryAfter as e:
+        bot_logger.warning(f"Превышен лимит запросов. Ожидание {e.retry_after} секунд...")
+        await asyncio.sleep(e.retry_after)
+        await safe_delete_messages(chat_id, message_ids)
+
 @dp.message(CommandStart())
 async def command_start_handler(message: Message, state: FSMContext) -> None:
     curr_time = time.strftime("%H:%M:%S", time.localtime())
@@ -44,23 +64,22 @@ async def command_start_handler(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     try:
         message_id = data["delete_messege"]
-        await bot.delete_messages(chat_id=message.chat.id, message_ids=message_id)
+        user_data = await state.get_data() 
+        await safe_delete_messages(message.chat.id, user_data.get("delete_messege", []))
     except KeyError:
         await message.answer(hello_message_text)
     await message.answer(start_message_text)
-    message_excel = await message.answer(pdf_message_text)
+    message_excel = await message.answer(excel_message_text)
     user_id = message.from_user.id
     await state.update_data(delete_messege=[message_excel.message_id], user_id=user_id)
     await state.set_state(UserStates.get_excel)
 
-
 @dp.message(UserStates.get_excel, F.content_type == "document")
-async def get_pdf_handler(message: Message, state: FSMContext):
+async def get_excel_handler(message: Message, state: FSMContext):
     bot_logger.info('Начало работы с документом')
     user_data = await state.get_data()
-    message_id = user_data["delete_messege"]
+    await safe_delete_messages(message.chat.id, user_data.get("delete_messege", []))
     user_id = user_data["user_id"]
-    await bot.delete_messages(chat_id=message.chat.id, message_ids=message_id)
 
     file_id = message.document.file_id
     file_name = f"{str(user_id)}_{message.document.file_name}"
@@ -70,26 +89,44 @@ async def get_pdf_handler(message: Message, state: FSMContext):
     file_path = file.file_path
     bot_logger.info(f'Документ "{file_name}" получен от пользователя {user_id}')
     await bot.download_file(file_path, f"files/{file_name}")
-    messege_id = message.message_id
-    await state.update_data(delete_messege=[messege_id + 1])
 
-    waiting_message_id = await message.answer(waiting_message)
+    mode_message_id = await message.answer(mode_message, reply_markup=get_keyboard('mode_kb'))
+    await state.update_data(delete_messege=[mode_message_id.message_id])
+    await state.set_state(UserStates.get_answer)
+
+
+@dp.callback_query(UserStates.get_answer, F.data.in_([button_gpt_gen, button_oesd_gen]))
+async def get_mode_handler(callback: CallbackQuery, state: FSMContext):
+    bot_logger.info('выбор режима')
+    if callback.data == button_gpt_gen:
+        api=GPTGenApi()
+        bot_logger.info(f'Режим {button_gpt_gen}')
+    elif callback.data == button_oesd_gen:
+        api=OEСDApi()
+        bot_logger.info(f'Режим {button_oesd_gen}')
+
+    bot_logger.info('Начало c API')
+    user_data = await state.get_data()
+    await safe_delete_messages(callback.message.chat.id, user_data.get("delete_messege", []))
+    file_name = user_data['file_name']
+
+    waiting_message_id = await callback.message.answer(waiting_message)
     try:
         answer = api.get_answer(f"files/{file_name}")
 
-        await bot.delete_messages(chat_id=message.chat.id, message_ids=[waiting_message_id.message_id])
+        await safe_delete_messages(callback.message.chat.id, [waiting_message_id.message_id])
         
-        await message.answer_document(FSInputFile(answer))
-        message_after = await message.answer(
+        await callback.message.answer_document(FSInputFile(answer))
+        message_after = await callback.message.answer(
             "Что бы запусть бота заново напишите /start"
         )
         bot_logger.info('Конец итерации')
         await state.update_data(delete_messege=[message_after.message_id])
         await state.clear()
     except TypeError as e:
-        await bot.delete_messages(chat_id=message.chat.id, message_ids=[waiting_message_id.message_id])
-        await message.answer('Что-то пошло не по плану(')
-        print(e)
+        await state.update_data(delete_messege=[message_after.message_id])
+        await callback.message.answer('Что-то пошло не по плану(')
+        bot_logger.error(e)
 
 
 @dp.message(StateFilter(UserStates.get_excel), F.content_type != "document")
@@ -98,13 +135,12 @@ async def warning_not_pdf(message: Message, state: FSMContext):
     message_id = data["delete_messege"]
     message_id.append(message.message_id - 1)
 
-    await bot.delete_messages(chat_id=message.chat.id, message_ids=message_id)
-    answer_text = f"{warning_pdf_message}\n\n{pdf_message_text}"
+    await safe_delete_messages(message.chat.id, data.get("delete_messege", []))
+    answer_text = f"{warning_pdf_message}\n\n{excel_message_text}"
     await message.answer(text=answer_text)
     messege_id = message.message_id
     await state.update_data(delete_messege=[messege_id, messege_id + 1])
     data = await state.get_data()
-    message_id = data["delete_messege"]
 
 
 if __name__ == "__main__":

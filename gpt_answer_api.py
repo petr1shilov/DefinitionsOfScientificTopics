@@ -22,7 +22,7 @@ api_logger.addHandler(handler)
 api_logger.setLevel(logging.INFO)
 
 
-class ParamsApi:
+class GPTGenApi:
     def __init__(self, api_key=config.api_key, model="gpt-4o"):
         self.api_key = api_key
         self.model = model
@@ -38,9 +38,7 @@ class ParamsApi:
             annotation_columns = [col for col in df.columns if 'аннотация' in col.lower()]
             annotation_dict = df.set_index('Название лаборатории / центра')[annotation_columns].apply(lambda row: row.tolist(), axis=1).to_dict()
             return annotation_dict        
-# annotation_columns = ['Название лаборатории / центра'] + [col for col in df.columns if 'аннотация' in col.lower()]
-#annotation_dict = {row[annotation_columns[0]]: row[annotation_columns[1:]].tolist() for _, row in df.iterrows()}
-        
+      
 
     def candidat_search(self, annotation_dict):
         start_time = time.time()
@@ -103,16 +101,15 @@ class ParamsApi:
 
     def dict_to_excel(self, doc, path):
         name_labs, total_candidats = zip(*doc.items())
-        
-        # Подготовка списка кандидатов с объединением строк по каждому элементу
-        list_of_total_candidats = ['\n'.join(candidat.replace('\n"','').replace('"','').split(',')) for candidat in total_candidats]
-        
-        # Создаем DataFrame
+
+        list_of_total_candidats = ['\n'.join(candidat.replace('\n"','').replace('"','').split(',')).replace('[','').replace(']','') for candidat in total_candidats]
+
         df = pd.DataFrame({
             'Название лаборатории / центра': name_labs,
             'Перечень компетенций / областей научных интересов лаборатории / центра': list_of_total_candidats
         })
-        path = f"{path[:-4]}_total.xlsx"
+
+        path = f"{path[:-5]}_total.xlsx"
         df.to_excel(path, index=False, engine='xlsxwriter')
         api_logger.info("Ответ запакован в xlsx")
         return path

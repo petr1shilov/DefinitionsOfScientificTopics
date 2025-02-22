@@ -3,3 +3,5 @@ __pycache__*
 .DS_Store
 *.xlsx
 *.pdf
+!kody_OECD.xlsx
+"oe\321\201d_api.py"
